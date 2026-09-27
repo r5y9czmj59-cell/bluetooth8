@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#101c38">
+  <title>micro:bit Bluetooth UART</title>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, sans-serif; background: #101c38; color: #f4f6fb; }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 24px; }
+    main { width: min(100%, 680px); background: #19294b; border: 1px solid #31466f; border-radius: 20px; padding: clamp(20px, 5vw, 36px); box-shadow: 0 20px 60px #0004; }
+    h1 { margin: 0 0 8px; font-size: clamp(1.6rem, 5vw, 2.2rem); }
+    p { color: #c1cce0; line-height: 1.55; }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; margin: 20px 0; }
+    button { border: 0; border-radius: 10px; padding: 12px 18px; background: #60d6b0; color: #102a32; font-weight: 700; cursor: pointer; }
+    button.secondary { background: #31466f; color: white; }
+    .arrow-buttons { display: flex; gap: 12px; margin: 10px 0 22px; }
+    button.arrow { width: 76px; height: 64px; padding: 0; font-size: 2rem; background: #7da7ff; color: #101c38; }
+    button:disabled, input:disabled { opacity: .5; cursor: not-allowed; }
+    label { display: block; font-weight: 650; margin: 18px 0 8px; }
+    input { width: 100%; border-radius: 10px; border: 1px solid #48618c; background: #101c38; color: white; padding: 12px; font: inherit; }
+    #status { padding: 12px 14px; background: #101c38; border-radius: 10px; color: #c1cce0; }
+    #status[data-state="connected"] { color: #79efc4; }
+    #log { height: 200px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; background: #0b1429; border-radius: 10px; padding: 14px; font: .9rem/1.5 ui-monospace, monospace; }
+    .hint { font-size: .9rem; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>micro:bit · Bluetooth UART</h1>
+  <p>Conecta una micro:bit V2 y envíale texto por Bluetooth LE. La micro:bit debe ejecutar un programa que active el servicio UART.</p>
+  <div id="status" role="status" aria-live="polite">Desconectado</div>
+  <div class="row">
+    <button id="connect">Conectar micro:bit</button>
+    <button id="disconnect" class="secondary" disabled>Desconectar</button>
+  </div>
+  <form id="sendForm">
+    <label for="message">Mensaje para la micro:bit</label>
+    <div class="row" style="margin-top:0">
+      <input id="message" maxlength="500" placeholder="Por ejemplo: hola" autocomplete="off" disabled>
+      <button id="send" type="submit" disabled>Enviar</button>
+    </div>
+  </form>
+  <label>Mostrar flecha en la micro:bit</label>
+  <div class="arrow-buttons">
+    <button id="arrowUp" class="arrow" type="button" aria-label="Mostrar flecha arriba" title="Arriba" disabled>↑</button>
+    <button id="arrowDown" class="arrow" type="button" aria-label="Mostrar flecha abajo" title="Abajo" disabled>↓</button>
+  </div>
+  <label for="log">Conversación</label>
+  <div id="log" aria-live="polite">Los mensajes recibidos aparecerán aquí.</div>
+  <p class="hint">Usa Chrome o Edge en un origen seguro (HTTPS o localhost). Si el selector no encuentra la placa, comprueba que UART esté activado en el programa de MakeCode.</p>
+</main>
+<script>
+(() => {
+  const SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
+  // En el perfil micro:bit los nombres RX/TX se definen desde la perspectiva de la placa.
+  const RX = '6e400003-b5a3-f393-e0a9-e50e24dcca9e'; // navegador -> micro:bit (write)
+  const TX = '6e400002-b5a3-f393-e0a9-e50e24dcca9e'; // micro:bit -> navegador (indicate)
+  const encoder = new TextEncoder();
+  const decoder = new TextDecoder();
+  const status = document.querySelector('#status');
+  const log = document.querySelector('#log');
+  const connectButton = document.querySelector('#connect');
+  const disconnectButton = document.querySelector('#disconnect');
+  const messageInput = document.querySelector('#message');
+  const sendButton = document.querySelector('#send');
+  const arrowUpButton = document.querySelector('#arrowUp');
+  const arrowDownButton = document.querySelector('#arrowDown');
+  let device, rxCharacteristic, txCharacteristic;
+  let receiveBuffer = '';
+
+  function setStatus(text, connected = false) {
+    status.textContent = text;
+    status.dataset.state = connected ? 'connected' : 'disconnected';
+    messageInput.disabled = !connected;
+    sendButton.disabled = !connected;
+    arrowUpButton.disabled = !connected;
+    arrowDownButton.disabled = !connected;
+    disconnectButton.disabled = !connected;
+  }
+  function appendLog(who, text) {
+    if (log.textContent === 'Los mensajes recibidos aparecerán aquí.') log.textContent = '';
+    log.textContent += `${new Date().toLocaleTimeString()} · ${who}: ${text}\n`;
+    log.scrollTop = log.scrollHeight;
+  }
+  function onNotification(event) {
+    receiveBuffer += decoder.decode(event.target.value, { stream: true });
+    const lines = receiveBuffer.split(/\r?\n/);
+    receiveBuffer = lines.pop();
+    for (const line of lines) if (line) appendLog('micro:bit', line);
+  }
+  function onDisconnected() {
+    rxCharacteristic = txCharacteristic = undefined;
+    setStatus('Desconectado');
+  }
+  async function connect() {
+    if (!('bluetooth' in navigator)) {
+      setStatus('Este navegador no ofrece Web Bluetooth. Prueba Chrome o Edge actualizado.');
+      return;
+    }
+
+    connectButton.disabled = true;
+    let selectedDevice;
+    let stage = 'seleccionar el dispositivo';
+    try {
+      // SERVICE debe estar en optionalServices para permitir el acceso GATT,
+      // ya que los filtros de nombre no conceden acceso a servicios.
+      selectedDevice = await navigator.bluetooth.requestDevice({
+        filters: [
+          { namePrefix: 'BBC micro:bit' },
+          { namePrefix: ' micro:bit' },
+          { namePrefix: 'micro:bit' }
+        ],
+        optionalServices: [SERVICE]
+      });
+      device = selectedDevice;
+      device.removeEventListener('gattserverdisconnected', onDisconnected);
+      device.addEventListener('gattserverdisconnected', onDisconnected);
+      setStatus(`Conectando con ${device.name || 'micro:bit'}…`);
+
+      let lastError;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          stage = 'establecer la conexión GATT';
+          const server = device.gatt.connected
+            ? device.gatt
+            : await device.gatt.connect();
+          if (!server.connected) throw new Error('El servidor GATT se desconectó al conectar.');
+
+          // Pausa breve solicitada antes de descubrir el servicio; evita demorar el GATT.
+          stage = 'esperar a que se estabilice Bluetooth';
+          await new Promise(resolve => setTimeout(resolve, 150));
+          if (!device.gatt.connected) throw new Error('La placa se desconectó durante la espera.');
+
+          stage = 'buscar el servicio UART';
+          const service = await device.gatt.getPrimaryService(SERVICE);
+          if (!device.gatt.connected) throw new Error('La placa se desconectó al buscar UART.');
+
+          stage = 'obtener el canal RX (web → micro:bit)';
+          rxCharacteristic = await service.getCharacteristic(RX);
+          stage = 'obtener el canal TX (micro:bit → web)';
+          txCharacteristic = await service.getCharacteristic(TX);
+          appendLog('diagnóstico', `UART encontrada. RX write=${rxCharacteristic.properties.write}, writeWithoutResponse=${rxCharacteristic.properties.writeWithoutResponse}; TX notify=${txCharacteristic.properties.notify}, indicate=${txCharacteristic.properties.indicate}.`);
+          stage = 'activar la recepción en el canal TX';
+          let notificationsAvailable = true;
+          try {
+            await txCharacteristic.startNotifications();
+            txCharacteristic.addEventListener('characteristicvaluechanged', onNotification);
+          } catch (notificationError) {
+            if (notificationError.name !== 'NotSupportedError' && !/not supported/i.test(notificationError.message)) {
+              throw notificationError;
+            }
+            notificationsAvailable = false;
+            const props = txCharacteristic.properties;
+            appendLog('diagnóstico', `Edge no pudo activar TX: ${notificationError.message}. TX notify=${props.notify}, indicate=${props.indicate}.`);
+          }
+
+          setStatus(notificationsAvailable
+            ? `Conectado: ${device.name || 'micro:bit'}`
+            : `Conectado (envío disponible; recepción no): ${device.name || 'micro:bit'}`, true);
+          appendLog('sistema', notificationsAvailable
+            ? 'Conexión UART lista para enviar y recibir.'
+            : 'Conexión UART activa; prueba el envío. La recepción quedó desactivada porque Edge rechazó TX.');
+          return;
+        } catch (error) {
+          lastError = error;
+          rxCharacteristic = txCharacteristic = undefined;
+          const linkDropped = !device.gatt.connected || /GATT Server is disconnected|disconnected/i.test(error.message);
+          if (!linkDropped || attempt === 3) throw error;
+
+          setStatus(`Se perdió el enlace BLE (intento ${attempt}/3); intentando reconectar…`);
+          // Silencia el evento de una desconexión que nosotros mismos iniciamos.
+          device.removeEventListener('gattserverdisconnected', onDisconnected);
+          try { if (device.gatt.connected) device.gatt.disconnect(); } catch (_) {}
+          await new Promise(resolve => setTimeout(resolve, 800));
+          device.addEventListener('gattserverdisconnected', onDisconnected);
+        }
+      }
+      throw lastError;
+    } catch (error) {
+      rxCharacteristic = txCharacteristic = undefined;
+      const cancelled = error.name === 'NotFoundError' && !selectedDevice;
+      const details = cancelled
+        ? 'No se seleccionó ningún dispositivo.'
+        : `Falló al ${stage}: ${error.message}`;
+      const message = cancelled
+        ? details
+        : `${details}. Comprueba que el programa active bluetooth.startUartService() y que ninguna otra app esté conectada.`;
+      // La limpieza puede emitir gattserverdisconnected; retira el listener para
+      // conservar en pantalla el error que originó el cierre.
+      if (device) device.removeEventListener('gattserverdisconnected', onDisconnected);
+      if (device?.gatt.connected) {
+        try { device.gatt.disconnect(); } catch (_) {}
+      }
+      setStatus(message);
+      if (!cancelled) appendLog('error', message);
+    } finally {
+      connectButton.disabled = false;
+    }
+  }
+  async function sendText(text, clearInput = false) {
+    if (!rxCharacteristic) return;
+    if (!text.trim()) return;
+    // UART BLE suele permitir 20 bytes por escritura. Divide UTF-8 sin partir caracteres.
+    const bytes = encoder.encode(text + '\n');
+    try {
+      for (let i = 0; i < bytes.length; i += 20) {
+        const chunk = bytes.slice(i, i + 20);
+        if (rxCharacteristic.properties.writeWithoutResponse) {
+          await rxCharacteristic.writeValueWithoutResponse(chunk);
+        } else {
+          await rxCharacteristic.writeValueWithResponse(chunk);
+        }
+      }
+      appendLog('yo', text);
+      if (clearInput) messageInput.value = '';
+    } catch (error) {
+      appendLog('error', `No se pudo enviar: ${error.message}`);
+    }
+  }
+  async function send(event) {
+    event.preventDefault();
+    await sendText(messageInput.value, true);
+  }
+  connectButton.addEventListener('click', connect);
+  disconnectButton.addEventListener('click', () => { if (device?.gatt.connected) device.gatt.disconnect(); });
+  document.querySelector('#sendForm').addEventListener('submit', send);
+  arrowUpButton.addEventListener('click', () => sendText('UP'));
+  arrowDownButton.addEventListener('click', () => sendText('DOWN'));
+})();
+</script>
+</body>
+</html>
+
+
+
